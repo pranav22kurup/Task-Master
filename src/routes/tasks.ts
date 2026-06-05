@@ -9,6 +9,8 @@ interface TaskRow {
   status: string;
   priority: string;
   assigneeId: number | null;
+  teamId: number | null;
+  projectId: number | null;
   dueDate: string | null;
   createdAt: string;
   updatedAt: string;
@@ -21,6 +23,8 @@ interface TaskResponse {
   status: string;
   priority: string;
   assigneeId: number | null;
+  teamId: number | null;
+  projectId: number | null;
   dueDate: string | null;
   createdAt: string;
   updatedAt: string;
@@ -30,6 +34,30 @@ const allowedStatuses = new Set(['todo', 'in-progress', 'done', 'blocked']);
 const allowedPriorities = new Set(['low', 'medium', 'high', 'urgent']);
 const allowedSortFields = new Set(['createdAt', 'updatedAt', 'dueDate', 'title', 'status', 'priority']);
 
+function loadTeam(database: AppDatabase, teamId: number) {
+  return database.prepare('SELECT id FROM teams WHERE id = ?').get(teamId) as { id: number } | undefined;
+}
+
+function loadProject(database: AppDatabase, projectId: number) {
+  return database.prepare('SELECT id, teamId FROM projects WHERE id = ?').get(projectId) as { id: number; teamId: number | null } | undefined;
+}
+
+function userIsTeamMember(database: AppDatabase, teamId: number, userId: number) {
+  const member = database
+    .prepare('SELECT teamId FROM team_members WHERE teamId = ? AND userId = ?')
+    .get(teamId, userId) as { teamId: number } | undefined;
+
+  return Boolean(member);
+}
+
+function userIsProjectMember(database: AppDatabase, projectId: number, userId: number) {
+  const member = database
+    .prepare('SELECT projectId FROM project_members WHERE projectId = ? AND userId = ?')
+    .get(projectId, userId) as { projectId: number } | undefined;
+
+  return Boolean(member);
+}
+
 function mapTask(task: TaskRow): TaskResponse {
   return {
     id: task.id,
@@ -38,6 +66,8 @@ function mapTask(task: TaskRow): TaskResponse {
     status: task.status,
     priority: task.priority,
     assigneeId: task.assigneeId,
+    teamId: task.teamId,
+    projectId: task.projectId,
     dueDate: task.dueDate,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -97,6 +127,26 @@ function buildSearchFilters(query: Record<string, unknown>) {
     parameters.push(assigneeId);
   }
 
+  const teamId = parseOptionalId(query.teamId);
+  if (teamId === null) {
+    return { error: 'Invalid teamId filter.', conditions, parameters } as const;
+  }
+
+  if (teamId !== undefined) {
+    conditions.push('teamId = ?');
+    parameters.push(teamId);
+  }
+
+  const projectId = parseOptionalId(query.projectId);
+  if (projectId === null) {
+    return { error: 'Invalid projectId filter.', conditions, parameters } as const;
+  }
+
+  if (projectId !== undefined) {
+    conditions.push('projectId = ?');
+    parameters.push(projectId);
+  }
+
   if (isNonEmptyString(query.dueBefore)) {
     conditions.push('dueDate <= ?');
     parameters.push(query.dueBefore.trim());
@@ -127,13 +177,22 @@ export function createTaskRouter(database: AppDatabase) {
   router.use(requireAuth);
 
   router.post('/', (request: AuthenticatedRequest, response) => {
-    const { title, description, dueDate, status, priority, assigneeId } = request.body as {
+    const currentUser = request.user;
+
+    if (!currentUser) {
+      response.status(401).json({ error: 'Unauthorized.' });
+      return;
+    }
+
+    const { title, description, dueDate, status, priority, assigneeId, teamId, projectId } = request.body as {
       title?: unknown;
       description?: unknown;
       dueDate?: unknown;
       status?: unknown;
       priority?: unknown;
       assigneeId?: unknown;
+      teamId?: unknown;
+      projectId?: unknown;
     };
 
     if (!isNonEmptyString(title)) {
@@ -167,12 +226,75 @@ export function createTaskRouter(database: AppDatabase) {
       }
     }
 
+    const normalizedTeamId = parseOptionalId(teamId);
+    if (normalizedTeamId === null) {
+      response.status(400).json({ error: 'Invalid teamId.' });
+      return;
+    }
+
+    if (normalizedTeamId !== undefined) {
+      const team = loadTeam(database, normalizedTeamId);
+
+      if (!team) {
+        response.status(400).json({ error: 'Team does not exist.' });
+        return;
+      }
+
+      if (!userIsTeamMember(database, normalizedTeamId, currentUser.id)) {
+        response.status(403).json({ error: 'You must be a team member to create tasks in that team.' });
+        return;
+      }
+    }
+
+    const normalizedProjectId = parseOptionalId(projectId);
+    if (normalizedProjectId === null) {
+      response.status(400).json({ error: 'Invalid projectId.' });
+      return;
+    }
+
+    let resolvedTeamId = normalizedTeamId;
+
+    if (normalizedProjectId !== undefined) {
+      const project = loadProject(database, normalizedProjectId);
+
+      if (!project) {
+        response.status(400).json({ error: 'Project does not exist.' });
+        return;
+      }
+
+      if (!userIsProjectMember(database, normalizedProjectId, currentUser.id)) {
+        response.status(403).json({ error: 'You must be a project member to create tasks in that project.' });
+        return;
+      }
+
+      if (project.teamId !== null) {
+        if (resolvedTeamId !== undefined && resolvedTeamId !== project.teamId) {
+          response.status(400).json({ error: 'Project must belong to the selected team.' });
+          return;
+        }
+
+        resolvedTeamId = project.teamId;
+      }
+    }
+
+    if (normalizedAssigneeId !== undefined) {
+      if (resolvedTeamId !== undefined && !userIsTeamMember(database, resolvedTeamId, normalizedAssigneeId)) {
+        response.status(400).json({ error: 'Assignee must be a member of the selected team.' });
+        return;
+      }
+
+      if (normalizedProjectId !== undefined && !userIsProjectMember(database, normalizedProjectId, normalizedAssigneeId)) {
+        response.status(400).json({ error: 'Assignee must be a member of the selected project.' });
+        return;
+      }
+    }
+
     const normalizedDueDate = isNonEmptyString(dueDate) ? dueDate.trim() : null;
 
     const result = database
       .prepare(
-        `INSERT INTO tasks (title, description, status, priority, assigneeId, dueDate)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO tasks (title, description, status, priority, assigneeId, teamId, projectId, dueDate)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         title.trim(),
@@ -180,11 +302,13 @@ export function createTaskRouter(database: AppDatabase) {
         normalizedStatus,
         normalizedPriority,
         normalizedAssigneeId ?? null,
+        resolvedTeamId ?? null,
+        normalizedProjectId ?? null,
         normalizedDueDate
       );
 
     const task = database
-      .prepare('SELECT id, title, description, status, priority, assigneeId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
+      .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(result.lastInsertRowid) as TaskRow | undefined;
 
     response.status(201).json({ task: task ? mapTask(task) : null });
@@ -208,7 +332,7 @@ export function createTaskRouter(database: AppDatabase) {
     const whereClause = filters.conditions.length > 0 ? `WHERE ${filters.conditions.join(' AND ')}` : '';
     const tasks = database
       .prepare(
-        `SELECT id, title, description, status, priority, assigneeId, dueDate, createdAt, updatedAt
+        `SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt
          FROM tasks
          ${whereClause}
          ORDER BY ${sort.clause}`
@@ -227,7 +351,7 @@ export function createTaskRouter(database: AppDatabase) {
     }
 
     const task = database
-      .prepare('SELECT id, title, description, status, priority, assigneeId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
+      .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(id) as TaskRow | undefined;
 
     if (!task) {
@@ -239,6 +363,13 @@ export function createTaskRouter(database: AppDatabase) {
   });
 
   router.patch('/:id', (request: AuthenticatedRequest, response) => {
+    const currentUser = request.user;
+
+    if (!currentUser) {
+      response.status(401).json({ error: 'Unauthorized.' });
+      return;
+    }
+
     const id = Number(request.params.id);
 
     if (!Number.isInteger(id) || id <= 0) {
@@ -247,7 +378,7 @@ export function createTaskRouter(database: AppDatabase) {
     }
 
     const task = database
-      .prepare('SELECT id, title, description, status, priority, assigneeId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
+      .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(id) as TaskRow | undefined;
 
     if (!task) {
@@ -255,13 +386,15 @@ export function createTaskRouter(database: AppDatabase) {
       return;
     }
 
-    const { title, description, dueDate, status, priority, assigneeId } = request.body as {
+    const { title, description, dueDate, status, priority, assigneeId, teamId, projectId } = request.body as {
       title?: unknown;
       description?: unknown;
       dueDate?: unknown;
       status?: unknown;
       priority?: unknown;
       assigneeId?: unknown;
+      teamId?: unknown;
+      projectId?: unknown;
     };
 
     const updates: string[] = [];
@@ -327,6 +460,92 @@ export function createTaskRouter(database: AppDatabase) {
       parameters.push(normalizedAssigneeId ?? null);
     }
 
+    let nextTeamId = task.teamId;
+
+    if (teamId !== undefined) {
+      const normalizedTeamId = parseOptionalId(teamId);
+
+      if (normalizedTeamId === null) {
+        response.status(400).json({ error: 'Invalid teamId.' });
+        return;
+      }
+
+      if (normalizedTeamId !== undefined) {
+        const team = loadTeam(database, normalizedTeamId);
+
+        if (!team) {
+          response.status(400).json({ error: 'Team does not exist.' });
+          return;
+        }
+
+        if (!userIsTeamMember(database, normalizedTeamId, currentUser.id)) {
+          response.status(403).json({ error: 'You must be a team member to move tasks into that team.' });
+          return;
+        }
+      }
+
+      nextTeamId = normalizedTeamId ?? null;
+      updates.push('teamId = ?');
+      parameters.push(nextTeamId);
+    }
+
+    if (projectId !== undefined) {
+      const normalizedProjectId = parseOptionalId(projectId);
+
+      if (normalizedProjectId === null) {
+        response.status(400).json({ error: 'Invalid projectId.' });
+        return;
+      }
+
+      if (normalizedProjectId !== undefined) {
+        const project = loadProject(database, normalizedProjectId);
+
+        if (!project) {
+          response.status(400).json({ error: 'Project does not exist.' });
+          return;
+        }
+
+        if (!userIsProjectMember(database, normalizedProjectId, currentUser.id)) {
+          response.status(403).json({ error: 'You must be a project member to move tasks into that project.' });
+          return;
+        }
+
+        if (project.teamId !== null) {
+          if (nextTeamId !== null && nextTeamId !== undefined && nextTeamId !== project.teamId) {
+            response.status(400).json({ error: 'Project must belong to the selected team.' });
+            return;
+          }
+
+          if (nextTeamId === task.teamId) {
+            nextTeamId = project.teamId;
+            updates.push('teamId = ?');
+            parameters.push(nextTeamId);
+          }
+        }
+      }
+
+      updates.push('projectId = ?');
+      parameters.push(normalizedProjectId ?? null);
+    }
+
+    const effectiveTeamId = teamId !== undefined ? nextTeamId : task.teamId;
+    const effectiveProjectId = projectId !== undefined ? parseOptionalId(projectId) : task.projectId;
+
+    if (assigneeId !== undefined) {
+      const normalizedAssigneeId = parseOptionalId(assigneeId);
+      if (normalizedAssigneeId !== undefined && normalizedAssigneeId !== null) {
+        if (effectiveTeamId !== undefined && effectiveTeamId !== null && !userIsTeamMember(database, effectiveTeamId, normalizedAssigneeId)) {
+          response.status(400).json({ error: 'Assignee must be a member of the selected team.' });
+          return;
+        }
+
+        if (effectiveProjectId !== undefined && effectiveProjectId !== null && !userIsProjectMember(database, effectiveProjectId, normalizedAssigneeId)) {
+          response.status(400).json({ error: 'Assignee must be a member of the selected project.' });
+          return;
+        }
+      }
+    }
+
     if (updates.length === 0) {
       response.status(400).json({ error: 'Provide at least one field to update.' });
       return;
@@ -338,7 +557,7 @@ export function createTaskRouter(database: AppDatabase) {
     database.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...parameters);
 
     const updatedTask = database
-      .prepare('SELECT id, title, description, status, priority, assigneeId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
+      .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(id) as TaskRow | undefined;
 
     response.json({ task: updatedTask ? mapTask(updatedTask) : null });
