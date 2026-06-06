@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { Router } from 'express';
 import { requireAuth, type AuthenticatedRequest } from '../auth';
 import type { AppDatabase } from '../db/database';
+import { addNotifications } from '../notifications';
 
 interface ProjectRow {
   id: number;
@@ -109,6 +110,15 @@ export function createProjectRouter(database: AppDatabase) {
       .prepare('INSERT INTO project_members (projectId, userId, role) VALUES (?, ?, ?)')
       .run(result.lastInsertRowid, currentUser.id, 'owner');
 
+    addNotifications(database, [currentUser.id], {
+      type: 'project.created',
+      title: 'Project created',
+      message: `You created ${name.trim()}.`,
+      entityType: 'project',
+      entityId: Number(result.lastInsertRowid),
+      metadata: { projectId: Number(result.lastInsertRowid) },
+    });
+
     const project = database
       .prepare('SELECT id, teamId, name, description, ownerId, joinCode, createdAt, updatedAt FROM projects WHERE id = ?')
       .get(result.lastInsertRowid) as ProjectRow | undefined;
@@ -143,6 +153,21 @@ export function createProjectRouter(database: AppDatabase) {
     }
 
     database.prepare('INSERT OR IGNORE INTO project_members (projectId, userId, role) VALUES (?, ?, ?)').run(project.id, currentUser.id, 'member');
+
+    const owner = database
+      .prepare('SELECT ownerId, name FROM projects WHERE id = ?')
+      .get(project.id) as { ownerId: number; name: string } | undefined;
+
+    if (owner) {
+      addNotifications(database, [owner.ownerId], {
+        type: 'project.joined',
+        title: 'Project joined',
+        message: `${currentUser.name} joined ${owner.name}.`,
+        entityType: 'project',
+        entityId: project.id,
+        metadata: { projectId: project.id, actorId: currentUser.id },
+      });
+    }
 
     const joinedProject = database
       .prepare('SELECT id, teamId, name, description, ownerId, joinCode, createdAt, updatedAt FROM projects WHERE id = ?')

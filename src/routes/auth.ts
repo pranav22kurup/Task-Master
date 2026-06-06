@@ -3,10 +3,13 @@ import type { AppDatabase } from '../db/database';
 import {
   hashPassword,
   requireAuth,
+  revokeAccessToken,
   signAccessToken,
   verifyPassword,
   type AuthenticatedRequest,
 } from '../auth';
+import { validateBody } from '../middleware/validate';
+import { registerSchema, loginSchema } from '../schemas/auth';
 
 interface UserRow {
   id: number;
@@ -49,22 +52,8 @@ function isNonEmptyString(value: unknown): value is string {
 export function createAuthRouter(database: AppDatabase) {
   const router = Router();
 
-  router.post('/register', async (request, response) => {
-    const { name, email, password } = request.body as {
-      name?: unknown;
-      email?: unknown;
-      password?: unknown;
-    };
-
-    if (!isNonEmptyString(name) || !isNonEmptyString(email) || !isNonEmptyString(password)) {
-      response.status(400).json({ error: 'Name, email, and password are required.' });
-      return;
-    }
-
-    if (password.trim().length < 8) {
-      response.status(400).json({ error: 'Password must be at least 8 characters long.' });
-      return;
-    }
+  router.post('/register', validateBody(registerSchema), async (request, response) => {
+    const { name, email, password } = request.body as { name: string; email: string; password: string };
 
     const normalizedEmail = normalizeEmail(email);
     const existingUser = database
@@ -106,16 +95,8 @@ export function createAuthRouter(database: AppDatabase) {
     });
   });
 
-  router.post('/login', async (request, response) => {
-    const { email, password } = request.body as {
-      email?: unknown;
-      password?: unknown;
-    };
-
-    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
-      response.status(400).json({ error: 'Email and password are required.' });
-      return;
-    }
+  router.post('/login', validateBody(loginSchema), async (request, response) => {
+    const { email, password } = request.body as { email: string; password: string };
 
     const user = database
       .prepare('SELECT id, name, email, passwordHash, role, createdAt, updatedAt FROM users WHERE email = ?')
@@ -135,6 +116,24 @@ export function createAuthRouter(database: AppDatabase) {
       }),
       user: mapToPublicUser(user),
     });
+  });
+
+  router.post('/logout', requireAuth, (request: AuthenticatedRequest, response) => {
+    const currentUser = request.user;
+
+    if (!currentUser) {
+      response.status(401).json({ error: 'Unauthorized.' });
+      return;
+    }
+
+    if (!request.tokenId) {
+      response.status(400).json({ error: 'This token cannot be revoked.' });
+      return;
+    }
+
+    revokeAccessToken(request.tokenId, currentUser.id);
+
+    response.status(204).send();
   });
 
   router.get('/me', requireAuth, (request: AuthenticatedRequest, response) => {

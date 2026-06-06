@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { Router } from 'express';
 import { requireAuth, type AuthenticatedRequest } from '../auth';
 import type { AppDatabase } from '../db/database';
+import { addNotifications } from '../notifications';
 
 interface TeamRow {
   id: number;
@@ -89,6 +90,15 @@ export function createTeamRouter(database: AppDatabase) {
       .prepare('INSERT INTO team_members (teamId, userId, role) VALUES (?, ?, ?)')
       .run(result.lastInsertRowid, currentUser.id, 'owner');
 
+    addNotifications(database, [currentUser.id], {
+      type: 'team.created',
+      title: 'Team created',
+      message: `You created ${name.trim()}.`,
+      entityType: 'team',
+      entityId: Number(result.lastInsertRowid),
+      metadata: { teamId: Number(result.lastInsertRowid) },
+    });
+
     const team = database
       .prepare('SELECT id, name, description, ownerId, joinCode, createdAt, updatedAt FROM teams WHERE id = ?')
       .get(result.lastInsertRowid) as TeamRow | undefined;
@@ -119,6 +129,21 @@ export function createTeamRouter(database: AppDatabase) {
     }
 
     database.prepare('INSERT OR IGNORE INTO team_members (teamId, userId, role) VALUES (?, ?, ?)').run(team.id, currentUser.id, 'member');
+
+    const owner = database
+      .prepare('SELECT ownerId, name FROM teams WHERE id = ?')
+      .get(team.id) as { ownerId: number; name: string } | undefined;
+
+    if (owner) {
+      addNotifications(database, [owner.ownerId], {
+        type: 'team.joined',
+        title: 'Team joined',
+        message: `${currentUser.name} joined ${owner.name}.`,
+        entityType: 'team',
+        entityId: team.id,
+        metadata: { teamId: team.id, actorId: currentUser.id },
+      });
+    }
 
     const joinedTeam = database
       .prepare('SELECT id, name, description, ownerId, joinCode, createdAt, updatedAt FROM teams WHERE id = ?')

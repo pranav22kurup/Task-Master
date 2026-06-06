@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import type { AppDatabase } from '../db/database';
 import { requireAuth, type AuthenticatedRequest } from '../auth';
+import { validateBody } from '../middleware/validate';
+import { createTaskSchema } from '../schemas/task';
+import { addNotifications } from '../notifications';
 
 interface TaskRow {
   id: number;
@@ -56,6 +59,41 @@ function userIsProjectMember(database: AppDatabase, projectId: number, userId: n
     .get(projectId, userId) as { projectId: number } | undefined;
 
   return Boolean(member);
+}
+
+function getTaskNotificationRecipients(database: AppDatabase, task: TaskRow, actorId: number) {
+  const recipientIds = new Set<number>();
+
+  if (task.assigneeId !== null && task.assigneeId !== actorId) {
+    recipientIds.add(task.assigneeId);
+  }
+
+  if (task.teamId !== null) {
+    const teamMembers = database
+      .prepare('SELECT userId FROM team_members WHERE teamId = ?')
+      .all(task.teamId) as Array<{ userId: number }>;
+
+    for (const member of teamMembers) {
+      if (member.userId !== actorId) {
+        recipientIds.add(member.userId);
+      }
+    }
+  }
+
+  if (task.projectId !== null) {
+    const projectMembers = database
+      .prepare('SELECT userId FROM project_members WHERE projectId = ?')
+      .all(task.projectId) as Array<{ userId: number }>;
+
+    for (const member of projectMembers) {
+      if (member.userId !== actorId) {
+        recipientIds.add(member.userId);
+      }
+    }
+  }
+
+  recipientIds.delete(actorId);
+  return recipientIds;
 }
 
 function mapTask(task: TaskRow): TaskResponse {
@@ -176,7 +214,7 @@ export function createTaskRouter(database: AppDatabase) {
 
   router.use(requireAuth);
 
-  router.post('/', (request: AuthenticatedRequest, response) => {
+  router.post('/', validateBody(createTaskSchema), (request: AuthenticatedRequest, response) => {
     const currentUser = request.user;
 
     if (!currentUser) {
@@ -185,14 +223,14 @@ export function createTaskRouter(database: AppDatabase) {
     }
 
     const { title, description, dueDate, status, priority, assigneeId, teamId, projectId } = request.body as {
-      title?: unknown;
-      description?: unknown;
-      dueDate?: unknown;
-      status?: unknown;
-      priority?: unknown;
-      assigneeId?: unknown;
-      teamId?: unknown;
-      projectId?: unknown;
+      title?: string;
+      description?: string | null;
+      dueDate?: string | null;
+      status?: string;
+      priority?: string;
+      assigneeId?: number | undefined;
+      teamId?: number | undefined;
+      projectId?: number | undefined;
     };
 
     if (!isNonEmptyString(title)) {
@@ -310,6 +348,17 @@ export function createTaskRouter(database: AppDatabase) {
     const task = database
       .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(result.lastInsertRowid) as TaskRow | undefined;
+
+    if (task) {
+      addNotifications(database, getTaskNotificationRecipients(database, task, currentUser.id), {
+        type: 'task.created',
+        title: 'Task created',
+        message: `${currentUser.name} created ${task.title}.`,
+        entityType: 'task',
+        entityId: task.id,
+        metadata: { taskId: task.id, actorId: currentUser.id },
+      });
+    }
 
     response.status(201).json({ task: task ? mapTask(task) : null });
   });
@@ -560,10 +609,28 @@ export function createTaskRouter(database: AppDatabase) {
       .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
       .get(id) as TaskRow | undefined;
 
+    if (updatedTask) {
+      addNotifications(database, getTaskNotificationRecipients(database, updatedTask, currentUser.id), {
+        type: 'task.updated',
+        title: 'Task updated',
+        message: `${currentUser.name} updated ${updatedTask.title}.`,
+        entityType: 'task',
+        entityId: updatedTask.id,
+        metadata: { taskId: updatedTask.id, actorId: currentUser.id },
+      });
+    }
+
     response.json({ task: updatedTask ? mapTask(updatedTask) : null });
   });
 
   router.delete('/:id', (_request: AuthenticatedRequest, response) => {
+    const currentUser = _request.user;
+
+    if (!currentUser) {
+      response.status(401).json({ error: 'Unauthorized.' });
+      return;
+    }
+
     const id = Number(_request.params.id);
 
     if (!Number.isInteger(id) || id <= 0) {
@@ -571,11 +638,26 @@ export function createTaskRouter(database: AppDatabase) {
       return;
     }
 
+    const task = database
+      .prepare('SELECT id, title, description, status, priority, assigneeId, teamId, projectId, dueDate, createdAt, updatedAt FROM tasks WHERE id = ?')
+      .get(id) as TaskRow | undefined;
+
     const deleted = database.prepare('DELETE FROM tasks WHERE id = ?').run(id);
 
     if (deleted.changes === 0) {
       response.status(404).json({ error: 'Task not found.' });
       return;
+    }
+
+    if (task) {
+      addNotifications(database, getTaskNotificationRecipients(database, task, currentUser.id), {
+        type: 'task.deleted',
+        title: 'Task deleted',
+        message: `${currentUser.name} deleted ${task.title}.`,
+        entityType: 'task',
+        entityId: task.id,
+        metadata: { taskId: task.id, actorId: currentUser.id },
+      });
     }
 
     response.status(204).send();
