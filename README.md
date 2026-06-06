@@ -259,4 +259,4 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke_e2e.ps1
 
 - The API listens on port `3000` by default.
 - If `OPENAI_API_KEY` is missing or invalid, AI generation falls back to local output.
-- The current implementation is intended for local development and evaluation, not production deployment without further hardening.
+- The current implementation is intended for local development and evaluation.
